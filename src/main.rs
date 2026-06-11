@@ -12,7 +12,7 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
+use redlib::{api, config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -297,6 +297,17 @@ async fn main() {
 	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
 	app.at("/settings/encoded-restore").post(|r| settings::encoded_restore(r).boxed());
 	app.at("/settings/update").get(|r| settings::update(r).boxed());
+
+	// REST API (JSON) under /api/v1
+	app.at("/api/v1").get(|r| api::index(r).boxed());
+	app.at("/api/v1/search").get(|r| api::search_endpoint(r).boxed());
+	app.at("/api/v1/comments/:id").get(|r| api::post_item(r).boxed());
+	app.at("/api/v1/user/:name").get(|r| api::user_profile(r).boxed());
+	app.at("/api/v1/user/:name/:listing").get(|r| api::user_profile(r).boxed());
+	app.at("/api/v1/r/:sub").get(|r| api::subreddit_listing(r).boxed());
+	app.at("/api/v1/r/:sub/search").get(|r| api::search_endpoint(r).boxed());
+	app.at("/api/v1/r/:sub/comments/:id").get(|r| api::post_item(r).boxed());
+	app.at("/api/v1/r/:sub/:sort").get(|r| api::subreddit_listing(r).boxed());
 
 	// RSS Subscriptions
 	app.at("/r/:sub.rss").get(|r| subreddit::rss(r).boxed());

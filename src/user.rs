@@ -105,7 +105,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 // USER
-async fn user(name: &str) -> Result<User, String> {
+pub async fn user(name: &str) -> Result<User, String> {
 	// Build the Reddit JSON API path
 	let path: String = format!("/user/{name}/about.json?raw_json=1");
 

@@ -463,7 +463,7 @@ impl Post {
 	}
 }
 
-#[derive(Template)]
+#[derive(Template, Serialize)]
 #[template(path = "comment.html")]
 /// Comment with content, post, score and data/time that it was posted
 pub struct Comment {
@@ -485,6 +485,7 @@ pub struct Comment {
 	pub collapsed: bool,
 	pub is_filtered: bool,
 	pub more_count: i64,
+	#[serde(skip_serializing)]
 	pub prefs: Preferences,
 }
 
@@ -579,7 +580,7 @@ pub struct NSFWLandingTemplate {
 	pub url: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 /// User struct containing metadata about user
 pub struct User {
 	pub name: String,
@@ -592,7 +593,7 @@ pub struct User {
 	pub nsfw: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 /// Subreddit struct containing metadata about community
 pub struct Subreddit {
 	pub name: String,

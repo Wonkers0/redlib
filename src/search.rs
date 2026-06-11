@@ -22,12 +22,13 @@ struct SearchParams {
 }
 
 // STRUCTS
-struct Subreddit {
-	name: String,
-	url: String,
-	icon: String,
-	description: String,
-	subscribers: (String, String),
+#[derive(serde::Serialize)]
+pub struct Subreddit {
+	pub name: String,
+	pub url: String,
+	pub icon: String,
+	pub description: String,
+	pub subscribers: (String, String),
 }
 
 #[derive(Template)]
@@ -165,7 +166,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 }
 
-async fn search_subreddits(q: &str, typed: &str) -> Vec<Subreddit> {
+pub async fn search_subreddits(q: &str, typed: &str) -> Vec<Subreddit> {
 	let limit = if typed == "sr_user" { "50" } else { "3" };
 	let subreddit_search_path = format!("/subreddits/search.json?q={}&limit={limit}", q.replace(' ', "+"));
 
