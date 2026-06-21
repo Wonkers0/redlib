@@ -327,6 +327,8 @@ pub struct Post {
 	pub title: String,
 	pub community: String,
 	pub body: String,
+	pub body_html: String,
+	pub body_markdown: String,
 	pub author: Author,
 	pub permalink: String,
 	pub link_title: String,
@@ -388,12 +390,15 @@ impl Post {
 			if body.is_empty() {
 				body = rewrite_urls(&val(post, "body_html"));
 			}
+			let body_markdown = val(post, "selftext");
 
 			posts.push(Self {
 				id: val(post, "id"),
 				title,
 				community: val(post, "subreddit"),
-				body,
+				body: body.clone(),
+				body_html: body,
+				body_markdown,
 				author: Author {
 					name: val(post, "author"),
 					flair: Flair {
@@ -804,21 +809,21 @@ pub async fn parse_post(post: &Value) -> Post {
 
 	let poll = Poll::parse(&post["data"]["poll_data"]);
 
+	// Raw markdown as authored on Reddit (empty for link posts / removed posts).
+	let body_markdown = val(post, "selftext");
+
 	let body = if val(post, "removed_by_category") == "moderator" {
 		format!(
 			"<div class=\"md\"><p>[removed] — <a href=\"https://{}{permalink}\">view removed post</a></p></div>",
 			get_setting("REDLIB_PUSHSHIFT_FRONTEND").unwrap_or_else(|| String::from(crate::config::DEFAULT_PUSHSHIFT_FRONTEND)),
 		)
+	} else if body_markdown.contains("```") {
+		let mut html_output = String::new();
+		let parser = pulldown_cmark::Parser::new(&body_markdown);
+		pulldown_cmark::html::push_html(&mut html_output, parser);
+		rewrite_urls(&html_output)
 	} else {
-		let selftext = val(post, "selftext");
-		if selftext.contains("```") {
-			let mut html_output = String::new();
-			let parser = pulldown_cmark::Parser::new(&selftext);
-			pulldown_cmark::html::push_html(&mut html_output, parser);
-			rewrite_urls(&html_output)
-		} else {
-			rewrite_urls(&val(post, "selftext_html"))
-		}
+		rewrite_urls(&val(post, "selftext_html"))
 	};
 
 	// Build a post using data parsed from Reddit post API
@@ -826,7 +831,9 @@ pub async fn parse_post(post: &Value) -> Post {
 		id: val(post, "id"),
 		title: val(post, "title"),
 		community: val(post, "subreddit"),
-		body,
+		body: body.clone(),
+		body_html: body,
+		body_markdown,
 		author: Author {
 			name: val(post, "author"),
 			flair: Flair {
