@@ -336,16 +336,23 @@ impl Server {
 						}
 					}
 
-					// If REDLIB_BEARER_TOKEN is set, require it on every request
-					if let Ok(expected) = std::env::var("REDLIB_BEARER_TOKEN") {
-						let authorized = req_headers
-							.get(header::AUTHORIZATION)
-							.and_then(|v| v.to_str().ok())
-							.map(|v| v == format!("Bearer {expected}"))
-							.unwrap_or(false);
+					// If REDLIB_BEARER_TOKEN is set, require it on every request except the
+					// media-proxy routes (/img, /preview) — those need to be fetchable by
+					// third parties (e.g. an LLM provider downloading an image URL) that
+					// can't be handed our bearer token.
+					let req_path = req.uri().path();
+					let is_media_route = req_path.starts_with("/img/") || req_path.starts_with("/preview/");
+					if !is_media_route {
+						if let Ok(expected) = std::env::var("REDLIB_BEARER_TOKEN") {
+							let authorized = req_headers
+								.get(header::AUTHORIZATION)
+								.and_then(|v| v.to_str().ok())
+								.map(|v| v == format!("Bearer {expected}"))
+								.unwrap_or(false);
 
-						if !authorized {
-							return new_boilerplate(def_headers, req_headers, 401, Body::from("Unauthorized")).boxed();
+							if !authorized {
+								return new_boilerplate(def_headers, req_headers, 401, Body::from("Unauthorized")).boxed();
+							}
 						}
 					}
 
