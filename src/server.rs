@@ -336,6 +336,19 @@ impl Server {
 						}
 					}
 
+					// If REDLIB_BEARER_TOKEN is set, require it on every request
+					if let Ok(expected) = std::env::var("REDLIB_BEARER_TOKEN") {
+						let authorized = req_headers
+							.get(header::AUTHORIZATION)
+							.and_then(|v| v.to_str().ok())
+							.map(|v| v == format!("Bearer {expected}"))
+							.unwrap_or(false);
+
+						if !authorized {
+							return new_boilerplate(def_headers, req_headers, 401, Body::from("Unauthorized")).boxed();
+						}
+					}
+
 					// Remove double slashes and decode encoded slashes
 					let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
 
