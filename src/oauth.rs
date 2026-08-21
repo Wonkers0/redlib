@@ -15,6 +15,18 @@ const AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+// A full pass over both backends takes under two minutes. Reddit rejects token
+// requests in short bursts, so giving up after one pass turned a transient
+// upstream failure into permanent downtime; these bound the wait between
+// passes instead.
+const OAUTH_RETRY_MIN_BACKOFF: Duration = Duration::from_secs(10);
+const OAUTH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+// How long a failed roll-over holds the in-progress flag. Requests keep using
+// the token we already have, and none of them spawn another roll-over until
+// this elapses.
+const OAUTH_ROLLOVER_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+
 // Response from OAuth backend authentication
 #[derive(Debug, Clone)]
 pub struct OauthResponse {
@@ -69,9 +81,9 @@ pub struct Oauth {
 }
 
 impl Oauth {
-	/// Create a new OAuth client
-	pub(crate) async fn new() -> Self {
-		// Try MobileSpoofAuth first, then fall back to GenericWebAuth
+	/// One pass at creating a client: five attempts against the mobile spoof,
+	/// then five against the generic web backend. `None` if all ten failed.
+	pub(crate) async fn try_new() -> Option<Self> {
 		let mut failure_count = 0;
 		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
 
@@ -80,7 +92,7 @@ impl Oauth {
 			match attempt {
 				Ok(Ok(oauth)) => {
 					info!("[✅] Successfully created OAuth client");
-					return oauth;
+					return Some(oauth);
 				}
 				Ok(Err(e)) => {
 					error!(
@@ -105,13 +117,30 @@ impl Oauth {
 				backend = OauthBackendImpl::GenericWeb(GenericWebAuth::new());
 			}
 
-			// Crash after 10 total failures
 			if failure_count >= 10 {
-				error!("[⛔] Failed to create OAuth client (mobile + generic)");
-				std::process::exit(1);
+				return None;
 			}
 
 			tokio::time::sleep(OAUTH_TIMEOUT).await;
+		}
+	}
+
+	/// Create a new OAuth client, retrying until one is obtained. This used to
+	/// exit the process once both backends had failed ten times between them,
+	/// which is a window of under two minutes - short enough that an ordinary
+	/// blip upstream killed an otherwise healthy instance and left it down
+	/// until someone restarted it by hand.
+	pub(crate) async fn new() -> Self {
+		let mut backoff = OAUTH_RETRY_MIN_BACKOFF;
+
+		loop {
+			if let Some(oauth) = Self::try_new().await {
+				return oauth;
+			}
+
+			error!("[⛔] Failed to create OAuth client (mobile + generic). Retrying in {backoff:?}...");
+			tokio::time::sleep(backoff).await;
+			backoff = (backoff * 2).min(OAUTH_RETRY_MAX_BACKOFF);
 		}
 	}
 
@@ -186,9 +215,24 @@ pub async fn force_refresh_token() {
 	}
 
 	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
-	let new_client = Oauth::new().await;
-	OAUTH_CLIENT.swap(new_client.into());
-	OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+
+	match Oauth::try_new().await {
+		Some(new_client) => {
+			OAUTH_CLIENT.swap(new_client.into());
+			OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+		}
+		None => {
+			// Keep the client we already have. A roll-over is triggered by the
+			// rate limit running low, not by the token expiring, so the current
+			// one is still valid and still better than nothing - this used to
+			// take the whole process down instead. Holding the in-progress flag
+			// across the backoff keeps requests on that token rather than
+			// spawning a fresh roll-over for every one of them.
+			error!("[⛔] Failed to roll over the OAuth client. Keeping the current one and retrying in {OAUTH_ROLLOVER_RETRY_BACKOFF:?}...");
+			tokio::time::sleep(OAUTH_ROLLOVER_RETRY_BACKOFF).await;
+		}
+	}
+
 	OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 }
 
