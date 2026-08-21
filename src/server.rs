@@ -342,7 +342,10 @@ impl Server {
 					// can't be handed our bearer token.
 					let req_path = req.uri().path();
 					let is_media_route = req_path.starts_with("/img/") || req_path.starts_with("/preview/");
-					if !is_media_route {
+					// /.health is exempt too, matching nitter, so the status
+					// dashboard can probe liveness without holding a secret.
+					let is_health_route = req_path == "/.health";
+					if !is_media_route && !is_health_route {
 						if let Ok(expected) = std::env::var("REDLIB_BEARER_TOKEN") {
 							let authorized = req_headers
 								.get(header::AUTHORIZATION)

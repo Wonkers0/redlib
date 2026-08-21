@@ -165,6 +165,19 @@ impl Oauth {
 	pub fn user_agent(&self) -> &str {
 		self.backend.user_agent()
 	}
+
+	/// Lifetime Reddit granted this token, in seconds.
+	pub fn expires_in(&self) -> u64 {
+		self.expires_in
+	}
+
+	/// Which spoof backend minted this token, for `/.health`.
+	pub fn backend_kind(&self) -> &'static str {
+		match self.backend {
+			OauthBackendImpl::MobileSpoof(_) => "mobile_spoof",
+			OauthBackendImpl::GenericWeb(_) => "generic_web",
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -220,6 +233,7 @@ pub async fn force_refresh_token() {
 		Some(new_client) => {
 			OAUTH_CLIENT.swap(new_client.into());
 			OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+			crate::health::note_rollover_success();
 		}
 		None => {
 			// Keep the client we already have. A roll-over is triggered by the
@@ -229,6 +243,7 @@ pub async fn force_refresh_token() {
 			// across the backoff keeps requests on that token rather than
 			// spawning a fresh roll-over for every one of them.
 			error!("[⛔] Failed to roll over the OAuth client. Keeping the current one and retrying in {OAUTH_ROLLOVER_RETRY_BACKOFF:?}...");
+			crate::health::note_rollover_failure();
 			tokio::time::sleep(OAUTH_ROLLOVER_RETRY_BACKOFF).await;
 		}
 	}

@@ -12,7 +12,7 @@ use log::{info, warn};
 use redlib::client::{proxy, rate_limit_check};
 use redlib::server;
 use redlib::utils::error;
-use redlib::{api, config, headers, instance_info};
+use redlib::{api, config, headers, health, instance_info};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -107,6 +107,8 @@ async fn main() {
 	// in OAUTH case, we need to retrieve the token to avoid paying penalty
 	// at first request
 
+	health::init();
+
 	info!("Evaluating config.");
 	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
@@ -143,6 +145,11 @@ async fn main() {
 	app.at("/preview/:loc/:id").get(|r| proxy(r, "https://{loc}view.redd.it/{id}").boxed());
 	app.at("/style/*path").get(|r| proxy(r, "https://styles.redditmedia.com/{path}").boxed());
 	app.at("/static/*path").get(|r| proxy(r, "https://www.redditstatic.com/{path}").boxed());
+
+	// Operational health, for the status dashboard. Deliberately outside the
+	// bearer-token gate so an unauthenticated probe can still tell up from
+	// degraded - it exposes no Reddit content, only our own counters.
+	app.at("/.health").get(|r| health::health(r).boxed());
 
 	// REST API (JSON) under /api/v1
 	app.at("/api/v1").get(|r| api::index(r).boxed());

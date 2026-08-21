@@ -31,6 +31,7 @@ pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
+	crate::health::note_token_issued();
 	tokio::spawn(token_daemon());
 	ArcSwap::new(client.into())
 });
@@ -356,6 +357,8 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					OAUTH_RATELIMIT_REMAINING.store(val.round() as u16, Ordering::SeqCst);
 				}
 
+				crate::health::note_ratelimit(reset.parse::<f32>().ok(), used.parse::<f32>().ok());
+
 				Some(reset)
 			} else {
 				None
@@ -369,6 +372,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					if !has_remaining {
 						// Rate limited, so spawn a force_refresh_token()
 						tokio::spawn(force_refresh_token());
+						crate::health::note_upstream(status.as_u16(), Some("Reddit rate limit exceeded".to_string()));
 						return match reset {
 							Some(val) => Err(format!(
 								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
@@ -376,6 +380,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 							)),
 							None => Err("Reddit rate limit exceeded".to_string()),
 						};
+					}
+
+					if status.is_server_error() {
+						crate::health::note_upstream(status.as_u16(), Some(format!("Reddit returned {status}")));
+					} else {
+						crate::health::note_upstream(status.as_u16(), None);
 					}
 
 					// Parse the response from Reddit as JSON
@@ -433,10 +443,16 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 					}
 				}
-				Err(e) => err("Failed receiving body from Reddit", e.to_string(), path),
+				Err(e) => {
+					crate::health::note_upstream(status.as_u16(), Some(format!("Failed receiving body from Reddit: {e}")));
+					err("Failed receiving body from Reddit", e.to_string(), path)
+				}
 			}
 		}
-		Err(e) => err("Couldn't send request to Reddit", e, path),
+		Err(e) => {
+			crate::health::note_upstream(0, Some(format!("Couldn't send request to Reddit: {e}")));
+			err("Couldn't send request to Reddit", e, path)
+		}
 	}
 }
 
