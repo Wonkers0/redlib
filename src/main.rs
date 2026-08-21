@@ -3,6 +3,7 @@
 #![allow(clippy::cmp_owned)]
 
 use clap::{Arg, ArgAction, Command};
+use pretty_env_logger::env_logger;
 use std::sync::LazyLock;
 
 use futures_lite::FutureExt;
@@ -21,7 +22,7 @@ async fn main() {
 	_ = dotenvy::dotenv();
 
 	// Initialize logger
-	pretty_env_logger::init();
+	init_logger();
 
 	let matches = Command::new("Redlib")
 		.version(env!("CARGO_PKG_VERSION"))
@@ -164,5 +165,55 @@ async fn main() {
 	// Run this server for... forever!
 	if let Err(e) = server.await {
 		eprintln!("Server error: {e}");
+	}
+}
+
+
+/// env_logger sends every record to stderr, whatever its level. Log collectors
+/// that infer severity from the stream then paint an entire run red, which
+/// hides the errors among the INFO lines rather than highlighting them.
+/// Errors keep stderr; everything else goes to stdout.
+struct SplitByLevel {
+	out: env_logger::Logger,
+	err: env_logger::Logger,
+}
+
+impl log::Log for SplitByLevel {
+	fn enabled(&self, metadata: &log::Metadata) -> bool {
+		self.out.enabled(metadata) || self.err.enabled(metadata)
+	}
+
+	fn log(&self, record: &log::Record) {
+		if record.level() == log::Level::Error {
+			self.err.log(record);
+		} else {
+			self.out.log(record);
+		}
+	}
+
+	fn flush(&self) {
+		self.out.flush();
+		self.err.flush();
+	}
+}
+
+fn init_logger() {
+	// Same filter source as pretty_env_logger::init().
+	let filters = std::env::var("RUST_LOG").unwrap_or_default();
+	let build = |target| {
+		pretty_env_logger::formatted_builder()
+			.parse_filters(&filters)
+			.target(target)
+			.build()
+	};
+
+	let logger = SplitByLevel {
+		out: build(env_logger::Target::Stdout),
+		err: build(env_logger::Target::Stderr),
+	};
+
+	let max_level = logger.out.filter();
+	if log::set_boxed_logger(Box::new(logger)).is_ok() {
+		log::set_max_level(max_level);
 	}
 }
