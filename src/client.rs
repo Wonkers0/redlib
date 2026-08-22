@@ -380,8 +380,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						crate::health::note_upstream(status.as_u16(), Some("Reddit rate limit exceeded".to_string()));
 						return match reset {
 							Some(val) => Err(format!(
-								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
-								 Rate limit will reset in: {val}"
+								// The trailing space matters: a `\` continuation eats the newline
+								// *and* the next line's indentation, so without it the sentences
+								// run together as "...seconds.Rate limit...".
+								"Reddit rate limit exceeded. Try refreshing in a few seconds. \
+								 Rate limit will reset in: {val} seconds"
 							)),
 							None => Err("Reddit rate limit exceeded".to_string()),
 						};
