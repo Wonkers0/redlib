@@ -335,7 +335,12 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
 		tokio::spawn(force_refresh_token());
 	}
-	OAUTH_RATELIMIT_REMAINING.fetch_sub(1, Ordering::SeqCst);
+	// Saturate at zero rather than wrapping. `fetch_sub` on an AtomicU16 wraps,
+	// so once Reddit reported the budget exhausted the counter went 0 -> 65535,
+	// and the `< 10` guard above could never be true again — silently disabling
+	// the roll-over that exists to recover from exactly that situation. Observed
+	// in production sitting at 65534 with Reddit returning 429s.
+	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| Some(remaining.saturating_sub(1)));
 
 	// Fetch the url...
 	match reddit_get(path.clone(), quarantine).await {
