@@ -380,10 +380,16 @@ impl Server {
 							let mut parammed = req;
 							parammed.set_params(found.params().clone());
 
+							// Name the route (params substituted back out) so upstream
+							// calls can be attributed to the redlib endpoint that
+							// caused them - /api/v1/search and the classifier's
+							// /api/v1/r/:sub are indistinguishable at the Reddit end.
+							let route = crate::telemetry::normalize_inbound(&path, found.params());
+
 							// Run the route's function
 							let func = (found.handler().to_owned().to_owned())(parammed);
 							async move {
-								match func.await {
+								match crate::telemetry::INBOUND_ROUTE.scope(route, func).await {
 									Ok(mut res) => {
 										res.headers_mut().extend(def_headers);
 										if is_head {

@@ -456,6 +456,34 @@ Redlib [supports](https://docs.rs/wreq/latest/wreq/#proxies) proxy usage using t
 - `socks5://` is the scheme for socks5 proxy
 - `socks5h://` is the scheme for socks5h proxy
 
+## Upstream telemetry
+
+Set `REDLIB_TELEMETRY=on` to record where upstream Reddit bandwidth goes, then read it as JSON from
+`/.metrics`. Off by default, because the report holds the full request paths — which name the subreddits
+and posts this instance's users read. Unlike `/.health`, `/.metrics` sits behind `REDLIB_BEARER_TOKEN`.
+
+Everything is measured where a Reddit response is actually read, so the request counts are real HTTP
+requests. A forward proxy's dashboard typically counts CONNECT tunnels instead, which makes its
+request column — and any bytes-per-request figure derived from it — unusable for this.
+
+The report covers:
+
+- `by_upstream_endpoint` — bytes per Reddit endpoint (`/comments/:id`, `/r/:sub/about`, …), with
+  p25/p50/p75/p90/p95/p99/max for both response size and latency. Percentiles come from a reservoir
+  sample; the totals and counts are exact.
+- `by_inbound_route` — the same, keyed by the redlib route that caused the call, so traffic from
+  `/api/v1/search` can be told apart from `/api/v1/r/:sub`.
+- `wire_bytes` vs `json_bytes` and their `compression_ratio` — a ratio near 1 means we are paying for
+  uncompressed responses.
+- `response_cache` — hit rate, globally and per endpoint.
+- `duplication` — requests and bytes spent re-fetching a path already fetched in the window. This is
+  the ceiling on what better caching or caller-side dedup could save.
+- `heaviest_paths` / `most_refetched_paths` — the top 50 individual paths by bytes and by repeat count.
+- `per_minute` — a rolling 24h request/byte curve.
+
+Memory is bounded: 8192 samples per endpoint and 50,000 distinct paths, after which new paths stop
+being admitted to the leaderboards (reported as `paths_untracked_over_cap`) while counting continues.
+
 ## Security
 
 This project uses [BoringSSL](https://boringssl.googlesource.com/boringssl/), built from source with patches from

@@ -319,9 +319,21 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	.boxed()
 }
 
-/// Make a request to a Reddit API and parse the JSON response
-#[cached(size = 100, time = 30, result = true)]
+/// Make a request to a Reddit API and parse the JSON response.
+///
+/// Split from the cached body so the call can be counted whether or not it
+/// reaches Reddit: `json_cached` only executes on a miss, so the difference
+/// between the two counters is the cache's real hit rate.
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
+	crate::telemetry::note_json_call(&path);
+	json_cached(path, quarantine).await
+}
+
+#[cached(size = 100, time = 30, result = true)]
+async fn json_cached(path: String, quarantine: bool) -> Result<Value, String> {
+	crate::telemetry::note_cache_miss(&path);
+	let started = std::time::Instant::now();
+
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
@@ -369,10 +381,29 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 				None
 			};
 
+			// content-length is the compressed, on-the-wire size - the bytes the
+			// proxy actually bills us for. Absent on a chunked response, which
+			// the telemetry layer accounts for separately rather than as zero.
+			let wire_bytes = response
+				.headers()
+				.get(wreq_header::CONTENT_LENGTH)
+				.and_then(|val| val.to_str().ok())
+				.and_then(|val| val.parse::<u64>().ok());
+
 			// asynchronously aggregate the chunks of the body
 			match hyper::body::aggregate(response.into_hyper_response()).await {
 				Ok(body) => {
 					let has_remaining = body.has_remaining();
+
+					crate::telemetry::record(crate::telemetry::Observation {
+						endpoint: crate::telemetry::normalize_upstream(&path),
+						path: path.split('?').next().unwrap_or(&path).to_string(),
+						status: status.as_u16(),
+						wire_bytes,
+						json_bytes: body.remaining() as u64,
+						duration_ms: started.elapsed().as_millis() as u64,
+						is_error: !status.is_success() || !has_remaining,
+					});
 
 					if !has_remaining {
 						// Rate limited, so spawn a force_refresh_token()
