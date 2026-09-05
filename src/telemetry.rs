@@ -67,8 +67,10 @@ fn current_route() -> String {
 #[derive(Default)]
 struct Bucket {
 	requests: u64,
-	/// Bytes as they crossed the wire - what the proxy bills. Taken from
-	/// content-length, which for a compressed response is the compressed size.
+	/// Decompressed response body bytes. Named `wire_bytes` when this was
+	/// written on the assumption content-length would survive; it does not -
+	/// tower-http removes it after inflating - so in practice this is almost
+	/// always the decompressed size. Reported as `body_bytes`.
 	wire_bytes: u64,
 	/// Bytes after decompression - what we actually parsed. The ratio between
 	/// the two is the proof that compression is or isn't working.
@@ -392,12 +394,9 @@ fn bucket_json(name: &str, bucket: &Bucket, total_bytes: u64, hour: u64) -> serd
 	json!({
 		"name": name,
 		"requests": bucket.requests,
-		"wire_bytes": bucket.wire_bytes,
-		"json_bytes": bucket.json_bytes,
-		"share_of_wire_bytes": if total_bytes == 0 { 0.0 } else { bucket.wire_bytes as f64 / total_bytes as f64 },
-		"mean_wire_bytes": if bucket.requests == 0 { 0 } else { bucket.wire_bytes / bucket.requests },
-		// >1 means compression is working; ~1 means we are paying for plaintext.
-		"compression_ratio": if bucket.wire_bytes == 0 { 0.0 } else { bucket.json_bytes as f64 / bucket.wire_bytes as f64 },
+		"body_bytes": bucket.wire_bytes,
+		"share_of_body_bytes": if total_bytes == 0 { 0.0 } else { bucket.wire_bytes as f64 / total_bytes as f64 },
+		"mean_body_bytes": if bucket.requests == 0 { 0 } else { bucket.wire_bytes / bucket.requests },
 		"responses_without_content_length": bucket.wire_missing,
 		"errors": bucket.errors,
 		"cache_hits": bucket.cache_hits,
@@ -406,7 +405,7 @@ fn bucket_json(name: &str, bucket: &Bucket, total_bytes: u64, hour: u64) -> serd
 		"status": bucket.status.iter().map(|(k, v)| (k.to_string(), *v)).collect::<HashMap<String, u64>>(),
 		// Percentiles describe the last WINDOW_HOURS; the counters above are
 		// lifetime. Both are wanted, so the report says which is which.
-		"wire_bytes_percentiles": percentiles(&wire_samples),
+		"body_bytes_percentiles": percentiles(&wire_samples),
 		"duration_ms_percentiles": percentiles(&duration_samples),
 	})
 }
@@ -472,7 +471,7 @@ fn snapshot() -> serde_json::Value {
 		.minutes
 		.iter()
 		.filter(|m| m.stamp != 0 && current.saturating_sub(m.stamp) < WINDOW_MINUTES as u64)
-		.map(|m| json!({ "minute": iso(m.stamp * 60), "requests": m.requests, "wire_bytes": m.wire_bytes }))
+		.map(|m| json!({ "minute": iso(m.stamp * 60), "requests": m.requests, "body_bytes": m.wire_bytes }))
 		.collect();
 	minutes.sort_by(|a, b| a["minute"].as_str().cmp(&b["minute"].as_str()));
 
@@ -482,11 +481,17 @@ fn snapshot() -> serde_json::Value {
 		// Counters and totals are lifetime; percentiles and per_minute cover
 		// this window. Said plainly so a long-lived process is not misread.
 		"percentile_window_hours": WINDOW_HOURS,
+		// Sizes are DECOMPRESSED response bodies, not billed on-wire bytes.
+		// tower-http's decompression layer strips content-length once it has
+		// inflated the body (it no longer describes it), so the compressed
+		// length is gone before we ever see the response. Ranking endpoints and
+		// measuring duplication are unaffected - both are relative - but these
+		// totals run roughly the compression ratio above what a proxy bills.
+		"byte_measurement": "decompressed_body",
 		"uptime_seconds": now_secs().saturating_sub(*STARTED_AT),
 		"totals": {
 			"upstream_requests": total_requests,
-			"upstream_wire_bytes": total_bytes,
-			"upstream_json_bytes": state.by_endpoint.values().map(|b| b.json_bytes).sum::<u64>(),
+			"upstream_body_bytes": total_bytes,
 			"errors": state.by_endpoint.values().map(|b| b.errors).sum::<u64>(),
 		},
 		// The claim under test: a 100-entry / 30s cache at this request rate
@@ -502,17 +507,17 @@ fn snapshot() -> serde_json::Value {
 		"duplication": {
 			"distinct_paths": state.paths.len(),
 			"redundant_requests": repeated_requests,
-			"redundant_wire_bytes": repeated_bytes,
+			"redundant_body_bytes": repeated_bytes,
 			"redundant_share_of_bytes": if total_bytes == 0 { 0.0 } else { repeated_bytes as f64 / total_bytes as f64 },
 			"paths_untracked_over_cap": state.paths_evicted,
 		},
 		"by_upstream_endpoint": endpoints.iter().map(|(name, b)| bucket_json(name, b, total_bytes, hour)).collect::<Vec<_>>(),
 		"by_inbound_route": routes.iter().map(|(name, b)| bucket_json(name, b, total_bytes, hour)).collect::<Vec<_>>(),
 		"heaviest_paths": by_bytes.iter().take(50)
-			.map(|(path, s)| json!({ "path": path, "requests": s.requests, "wire_bytes": s.wire_bytes }))
+			.map(|(path, s)| json!({ "path": path, "requests": s.requests, "body_bytes": s.wire_bytes }))
 			.collect::<Vec<_>>(),
 		"most_refetched_paths": by_repeat.iter().take(50)
-			.map(|(path, s)| json!({ "path": path, "requests": s.requests, "wire_bytes": s.wire_bytes }))
+			.map(|(path, s)| json!({ "path": path, "requests": s.requests, "body_bytes": s.wire_bytes }))
 			.collect::<Vec<_>>(),
 		"per_minute": minutes,
 	})
@@ -584,24 +589,23 @@ mod tests {
 
 		let snap = snapshot();
 		assert_eq!(snap["totals"]["upstream_requests"], 53);
-		assert_eq!(snap["totals"]["upstream_wire_bytes"], 12_100_000);
+		assert_eq!(snap["totals"]["upstream_body_bytes"], 12_100_000);
 
 		// Heaviest endpoint sorts first, and its percentiles are its own -
 		// not diluted by the 50 small calls.
 		let top = &snap["by_upstream_endpoint"][0];
 		assert_eq!(top["name"], "/comments/:id");
 		assert_eq!(top["requests"], 3);
-		assert_eq!(top["wire_bytes_percentiles"]["p50"], 4_000_000);
-		assert_eq!(top["compression_ratio"], 8.0);
+		assert_eq!(top["body_bytes_percentiles"]["p50"], 4_000_000);
 
 		let small = &snap["by_upstream_endpoint"][1];
 		assert_eq!(small["name"], "/r/:sub/about");
-		assert_eq!(small["wire_bytes_percentiles"]["p99"], 2_000);
+		assert_eq!(small["body_bytes_percentiles"]["p99"], 2_000);
 
 		// Two of the three thread fetches were redundant.
 		assert_eq!(snap["duplication"]["distinct_paths"], 51);
 		assert_eq!(snap["duplication"]["redundant_requests"], 2);
-		assert_eq!(snap["duplication"]["redundant_wire_bytes"], 8_000_000);
+		assert_eq!(snap["duplication"]["redundant_body_bytes"], 8_000_000);
 
 		// Traffic lands in the rolling window, not just the totals.
 		let minutes = snap["per_minute"].as_array().expect("per_minute is an array");

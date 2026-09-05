@@ -475,8 +475,11 @@ The report covers:
   totals, and exact.
 - `by_inbound_route` — the same, keyed by the redlib route that caused the call, so traffic from
   `/api/v1/search` can be told apart from `/api/v1/r/:sub`.
-- `wire_bytes` vs `json_bytes` and their `compression_ratio` — a ratio near 1 means we are paying for
-  uncompressed responses.
+- Sizes are **decompressed response bodies** (`byte_measurement: "decompressed_body"`), not billed
+  on-wire bytes. `tower-http`'s decompression layer strips `content-length` once it has inflated the
+  body, so the compressed length is gone before redlib sees the response. Endpoint ranking and the
+  duplication figures are relative and so unaffected, but the absolute totals run roughly the
+  compression ratio (typically 6-8x for JSON) above what a forward proxy bills.
 - `response_cache` — hit rate, globally and per endpoint.
 - `duplication` — requests and bytes spent re-fetching a path already fetched in the window. This is
   the ceiling on what better caching or caller-side dedup could save.
