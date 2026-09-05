@@ -470,7 +470,9 @@ The report covers:
 
 - `by_upstream_endpoint` — bytes per Reddit endpoint (`/comments/:id`, `/r/:sub/about`, …), with
   p25/p50/p75/p90/p95/p99/max for both response size and latency. Percentiles come from a reservoir
-  sample; the totals and counts are exact.
+  sample over a rolling 24h window (`percentile_window_hours`), rotated hourly, so they keep meaning
+  "recently" however long the process runs. The byte and request counters beside them are lifetime
+  totals, and exact.
 - `by_inbound_route` — the same, keyed by the redlib route that caused the call, so traffic from
   `/api/v1/search` can be told apart from `/api/v1/r/:sub`.
 - `wire_bytes` vs `json_bytes` and their `compression_ratio` — a ratio near 1 means we are paying for
@@ -481,8 +483,9 @@ The report covers:
 - `heaviest_paths` / `most_refetched_paths` — the top 50 individual paths by bytes and by repeat count.
 - `per_minute` — a rolling 24h request/byte curve.
 
-Memory is bounded: 8192 samples per endpoint and 50,000 distinct paths, after which new paths stop
-being admitted to the leaderboards (reported as `paths_untracked_over_cap`) while counting continues.
+Memory is bounded: 512 samples per endpoint per hour over a 24h window, and 50,000 distinct paths,
+after which new paths stop being admitted to the leaderboards (reported as `paths_untracked_over_cap`)
+while counting continues.
 
 ## Security
 

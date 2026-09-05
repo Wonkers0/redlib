@@ -28,8 +28,17 @@ use time::{macros::format_description, OffsetDateTime};
 /// Samples retained per bucket for percentile estimation. Percentiles come
 /// from a reservoir rather than a full log: bounded memory, and unbiased for
 /// any window length, which matters when one endpoint sees a thousand times
-/// the traffic of another. Totals and counts are exact atomics regardless.
-const RESERVOIR: usize = 8192;
+/// the traffic of another. Totals and counts stay exact regardless.
+///
+/// One reservoir per hour, rotated, rather than one for all time. A single
+/// reservoir samples uniformly over every observation since process start, so
+/// its percentiles would silently drift from "the last day" to "all time" the
+/// longer the process ran - which is exactly the question this is meant to
+/// answer. Merging the last `WINDOW_HOURS` slots keeps them on a real window.
+const SAMPLES_PER_HOUR: usize = 512;
+
+/// Hours of percentile samples retained - the same 24h horizon as `per_minute`.
+const WINDOW_HOURS: usize = 24;
 
 /// Distinct full paths tracked for the re-fetch and top-talker tables. Past
 /// this we stop admitting new paths but keep counting the ones already held,
@@ -69,42 +78,92 @@ struct Bucket {
 	cache_misses: u64,
 	errors: u64,
 	status: HashMap<u16, u64>,
-	wire_samples: Vec<u64>,
-	duration_samples: Vec<u64>,
+	/// One reservoir per hour slot, indexed by hour-since-epoch modulo
+	/// `WINDOW_HOURS`. A slot whose stamp is stale has been lapped and is
+	/// cleared on first touch rather than swept, so there is no timer.
+	hours: Vec<HourSlot>,
+}
+
+/// An hour's worth of samples for one bucket.
+#[derive(Default, Clone)]
+struct HourSlot {
+	stamp: u64,
+	/// Observations seen in this slot, which is the `n` the reservoir needs.
+	/// Distinct from the bucket's lifetime `requests`.
+	seen: u64,
+	wire: Vec<u64>,
+	duration: Vec<u64>,
 }
 
 impl Bucket {
-	/// Reservoir sampling (Vitter's R). `seen` is the count *including* this
-	/// observation, so the first RESERVOIR always land.
+	/// Reservoir sampling (Vitter's R) within one hour slot. `seen` is the
+	/// count *including* this observation, so the first `SAMPLES_PER_HOUR`
+	/// always land.
 	fn sample(target: &mut Vec<u64>, seen: u64, value: u64) {
-		if target.len() < RESERVOIR {
+		if target.len() < SAMPLES_PER_HOUR {
 			target.push(value);
 			return;
 		}
 		let index = fastrand::u64(..seen);
-		if (index as usize) < RESERVOIR {
+		if (index as usize) < SAMPLES_PER_HOUR {
 			target[index as usize] = value;
 		}
 	}
 
-	fn record(&mut self, obs: &Observation) {
+	/// The slot for the current hour, cleared first if it belongs to a
+	/// previous day.
+	fn slot(&mut self, hour: u64) -> &mut HourSlot {
+		if self.hours.is_empty() {
+			self.hours.resize(WINDOW_HOURS, HourSlot::default());
+		}
+		let slot = &mut self.hours[(hour as usize) % WINDOW_HOURS];
+		if slot.stamp != hour {
+			slot.stamp = hour;
+			slot.seen = 0;
+			slot.wire.clear();
+			slot.duration.clear();
+		}
+		slot
+	}
+
+	/// Samples from the last `WINDOW_HOURS`, merged. Slots lapped by a full
+	/// window are skipped rather than cleared - `record` clears them on touch.
+	fn window_samples(&self, hour: u64) -> (Vec<u64>, Vec<u64>) {
+		let mut wire = Vec::new();
+		let mut duration = Vec::new();
+		for slot in &self.hours {
+			if slot.stamp == 0 || hour.saturating_sub(slot.stamp) >= WINDOW_HOURS as u64 {
+				continue;
+			}
+			wire.extend_from_slice(&slot.wire);
+			duration.extend_from_slice(&slot.duration);
+		}
+		(wire, duration)
+	}
+
+	fn record(&mut self, obs: &Observation, hour: u64) {
 		self.requests += 1;
 		self.json_bytes += obs.json_bytes;
-		match obs.wire_bytes {
-			Some(bytes) => {
-				self.wire_bytes += bytes;
-				Self::sample(&mut self.wire_samples, self.requests, bytes);
-			}
+
+		let billed = match obs.wire_bytes {
+			Some(bytes) => bytes,
 			// Chunked responses arrive without a content-length. Counting them
 			// as zero would understate the bill, so they are tallied
 			// separately and the decompressed size stands in for the sample.
 			None => {
 				self.wire_missing += 1;
-				self.wire_bytes += obs.json_bytes;
-				Self::sample(&mut self.wire_samples, self.requests, obs.json_bytes);
+				obs.json_bytes
 			}
-		}
-		Self::sample(&mut self.duration_samples, self.requests, obs.duration_ms);
+		};
+		self.wire_bytes += billed;
+
+		let duration = obs.duration_ms;
+		let slot = self.slot(hour);
+		slot.seen += 1;
+		let seen = slot.seen;
+		Self::sample(&mut slot.wire, seen, billed);
+		Self::sample(&mut slot.duration, seen, duration);
+
 		*self.status.entry(obs.status).or_insert(0) += 1;
 		if obs.is_error {
 			self.errors += 1;
@@ -113,6 +172,7 @@ impl Bucket {
 }
 
 /// One completed upstream fetch.
+#[derive(Clone)]
 pub struct Observation {
 	pub endpoint: String,
 	pub path: String,
@@ -269,8 +329,9 @@ pub fn record(obs: Observation) {
 	let route = current_route();
 	let Ok(mut state) = STATE.write() else { return };
 
-	state.by_endpoint.entry(obs.endpoint.clone()).or_default().record(&obs);
-	state.by_route.entry(route).or_default().record(&obs);
+	let hour = now_secs() / 3600;
+	state.by_endpoint.entry(obs.endpoint.clone()).or_default().record(&obs, hour);
+	state.by_route.entry(route).or_default().record(&obs, hour);
 
 	let billed = obs.wire_bytes.unwrap_or(obs.json_bytes);
 
@@ -323,7 +384,8 @@ fn percentiles(samples: &[u64]) -> serde_json::Value {
 	})
 }
 
-fn bucket_json(name: &str, bucket: &Bucket, total_bytes: u64) -> serde_json::Value {
+fn bucket_json(name: &str, bucket: &Bucket, total_bytes: u64, hour: u64) -> serde_json::Value {
+	let (wire_samples, duration_samples) = bucket.window_samples(hour);
 	let cache_calls = bucket.cache_hits + bucket.cache_misses;
 	let cache_hit_rate = if cache_calls == 0 { 0.0 } else { bucket.cache_hits as f64 / cache_calls as f64 };
 
@@ -342,8 +404,10 @@ fn bucket_json(name: &str, bucket: &Bucket, total_bytes: u64) -> serde_json::Val
 		"cache_misses": bucket.cache_misses,
 		"cache_hit_rate": cache_hit_rate,
 		"status": bucket.status.iter().map(|(k, v)| (k.to_string(), *v)).collect::<HashMap<String, u64>>(),
-		"wire_bytes_percentiles": percentiles(&bucket.wire_samples),
-		"duration_ms_percentiles": percentiles(&bucket.duration_samples),
+		// Percentiles describe the last WINDOW_HOURS; the counters above are
+		// lifetime. Both are wanted, so the report says which is which.
+		"wire_bytes_percentiles": percentiles(&wire_samples),
+		"duration_ms_percentiles": percentiles(&duration_samples),
 	})
 }
 
@@ -402,6 +466,7 @@ fn snapshot() -> serde_json::Value {
 	let calls = JSON_CALLS.load(Ordering::Relaxed);
 	let misses = CACHE_MISSES.load(Ordering::Relaxed);
 
+	let hour = now_secs() / 3600;
 	let current = now_secs() / 60;
 	let mut minutes: Vec<serde_json::Value> = state
 		.minutes
@@ -414,6 +479,9 @@ fn snapshot() -> serde_json::Value {
 	json!({
 		"enabled": true,
 		"collecting_since": iso(*STARTED_AT),
+		// Counters and totals are lifetime; percentiles and per_minute cover
+		// this window. Said plainly so a long-lived process is not misread.
+		"percentile_window_hours": WINDOW_HOURS,
 		"uptime_seconds": now_secs().saturating_sub(*STARTED_AT),
 		"totals": {
 			"upstream_requests": total_requests,
@@ -438,8 +506,8 @@ fn snapshot() -> serde_json::Value {
 			"redundant_share_of_bytes": if total_bytes == 0 { 0.0 } else { repeated_bytes as f64 / total_bytes as f64 },
 			"paths_untracked_over_cap": state.paths_evicted,
 		},
-		"by_upstream_endpoint": endpoints.iter().map(|(name, b)| bucket_json(name, b, total_bytes)).collect::<Vec<_>>(),
-		"by_inbound_route": routes.iter().map(|(name, b)| bucket_json(name, b, total_bytes)).collect::<Vec<_>>(),
+		"by_upstream_endpoint": endpoints.iter().map(|(name, b)| bucket_json(name, b, total_bytes, hour)).collect::<Vec<_>>(),
+		"by_inbound_route": routes.iter().map(|(name, b)| bucket_json(name, b, total_bytes, hour)).collect::<Vec<_>>(),
 		"heaviest_paths": by_bytes.iter().take(50)
 			.map(|(path, s)| json!({ "path": path, "requests": s.requests, "wire_bytes": s.wire_bytes }))
 			.collect::<Vec<_>>(),
@@ -556,6 +624,66 @@ mod tests {
 		let bucket = &snap["by_upstream_endpoint"][0];
 		assert_eq!(bucket["cache_hits"], 2);
 		assert_eq!(bucket["cache_misses"], 1);
+	}
+
+	/// The reason for rotating reservoirs at all: yesterday's sizes must not
+	/// survive into today's percentiles.
+	#[test]
+	fn percentile_window_drops_hours_older_than_the_window() {
+		let mut bucket = Bucket::default();
+		let hour = 1_000_000u64;
+
+		let old = Observation {
+			endpoint: "/comments/:id".into(),
+			path: "/comments/old".into(),
+			status: 200,
+			wire_bytes: Some(9_000_000),
+			json_bytes: 9_000_000,
+			duration_ms: 5,
+			is_error: false,
+		};
+		let new = Observation { wire_bytes: Some(1_000), path: "/comments/new".into(), ..old.clone() };
+
+		bucket.record(&old, hour);
+		assert_eq!(bucket.window_samples(hour).0, vec![9_000_000]);
+
+		// One hour later both are in the window.
+		bucket.record(&new, hour + 1);
+		let (mut wire, _) = bucket.window_samples(hour + 1);
+		wire.sort_unstable();
+		assert_eq!(wire, vec![1_000, 9_000_000]);
+
+        // A full window on, the old hour has aged out but the newer one has not.
+		let (wire, _) = bucket.window_samples(hour + WINDOW_HOURS as u64);
+		assert_eq!(wire, vec![1_000]);
+
+		// Beyond the window, nothing survives - while the lifetime counters do.
+		assert!(bucket.window_samples(hour + WINDOW_HOURS as u64 + 1).0.is_empty());
+		assert_eq!(bucket.requests, 2);
+		assert_eq!(bucket.wire_bytes, 9_001_000);
+	}
+
+	/// A slot reused a full day later must be cleared, not appended to.
+	#[test]
+	fn lapped_hour_slot_is_reset_rather_than_appended() {
+		let mut bucket = Bucket::default();
+		let obs = Observation {
+			endpoint: "/comments/:id".into(),
+			path: "/comments/a".into(),
+			status: 200,
+			wire_bytes: Some(500),
+			json_bytes: 500,
+			duration_ms: 1,
+			is_error: false,
+		};
+
+		let hour = 1_000_000u64;
+		bucket.record(&obs, hour);
+		// Same slot index, exactly one window later.
+		bucket.record(&obs, hour + WINDOW_HOURS as u64);
+
+		let (wire, _) = bucket.window_samples(hour + WINDOW_HOURS as u64);
+		assert_eq!(wire, vec![500], "the lapped slot kept a stale sample");
 	}
 
 	#[test]
