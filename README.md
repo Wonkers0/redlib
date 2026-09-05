@@ -481,8 +481,13 @@ The report covers:
   duplication figures are relative and so unaffected, but the absolute totals run roughly the
   compression ratio (typically 6-8x for JSON) above what a forward proxy bills.
 - `response_cache` — hit rate, globally and per endpoint.
-- `duplication` — requests and bytes spent re-fetching a path already fetched in the window. This is
-  the ceiling on what better caching or caller-side dedup could save.
+- `repeat_fetches` — re-fetches of an already-seen path, which is deliberately *not* reported as
+  waste: re-running a monitoring search on an interval is the mechanism, not duplication, and a raw
+  repeat count cannot tell the two apart. Two breakdowns can be acted on instead:
+  `caught_by_cache_ttl` gives the upstream calls a cache of each TTL would have served (cumulative,
+  so pick a TTL and read off the saving), and `returned_unchanged` counts repeats whose response was
+  the same size as the previous one — a poll that learned nothing. A search that finds new posts is
+  excluded from the latter; a high share means the poll interval outruns the change rate.
 - `heaviest_paths` / `most_refetched_paths` — the top 50 individual paths by bytes and by repeat count.
 - `per_minute` — a rolling 24h request/byte curve.
 

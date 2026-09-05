@@ -80,6 +80,14 @@ struct Bucket {
 	cache_misses: u64,
 	errors: u64,
 	status: HashMap<u16, u64>,
+	/// Fetches of a path this bucket had already fetched.
+	repeats: u64,
+	/// ...of which returned a same-sized response, so bought nothing.
+	repeats_unchanged: u64,
+	repeat_bytes: u64,
+	repeats_unchanged_bytes: u64,
+	/// Repeats by inter-fetch gap, parallel to `GAP_BUCKETS`.
+	repeat_gaps: [u64; GAP_BUCKETS.len()],
 	/// One reservoir per hour slot, indexed by hour-since-epoch modulo
 	/// `WINDOW_HOURS`. A slot whose stamp is stale has been lapped and is
 	/// cleared on first touch rather than swept, so there is no timer.
@@ -143,7 +151,7 @@ impl Bucket {
 		(wire, duration)
 	}
 
-	fn record(&mut self, obs: &Observation, hour: u64) {
+	fn record(&mut self, obs: &Observation, hour: u64, repeat: Option<Repeat>) {
 		self.requests += 1;
 		self.json_bytes += obs.json_bytes;
 
@@ -165,6 +173,17 @@ impl Bucket {
 		let seen = slot.seen;
 		Self::sample(&mut slot.wire, seen, billed);
 		Self::sample(&mut slot.duration, seen, duration);
+
+		if let Some(repeat) = repeat {
+			self.repeats += 1;
+			self.repeat_bytes += billed;
+			if repeat.unchanged {
+				self.repeats_unchanged += 1;
+				self.repeats_unchanged_bytes += billed;
+			}
+			let slot = GAP_BUCKETS.iter().position(|(limit, _)| repeat.gap_seconds < *limit).unwrap_or(GAP_BUCKETS.len() - 1);
+			self.repeat_gaps[slot] += 1;
+		}
 
 		*self.status.entry(obs.status).or_insert(0) += 1;
 		if obs.is_error {
@@ -189,6 +208,35 @@ pub struct Observation {
 struct PathStat {
 	requests: u64,
 	wire_bytes: u64,
+	/// When this path was last fetched, to measure the gap to the next fetch.
+	last_seen: u64,
+	/// Size of the last response, used as a cheap stand-in for "did anything
+	/// change". Two JSON listings of identical length are all but certainly
+	/// identical; hashing the body would be exact but needs a contiguous copy
+	/// of a body that can run to tens of MB, on the hot path.
+	last_size: u64,
+}
+
+/// Gap thresholds, in seconds, for "a cache with this TTL would have caught
+/// this re-fetch". The last bucket is everything beyond the largest TTL worth
+/// considering - re-fetches that no reasonable cache should serve from.
+const GAP_BUCKETS: [(u64, &str); 7] = [
+	(30, "within_30s"),
+	(60, "within_1m"),
+	(300, "within_5m"),
+	(900, "within_15m"),
+	(3600, "within_1h"),
+	(21600, "within_6h"),
+	(u64::MAX, "over_6h"),
+];
+
+/// What a repeat fetch of an already-seen path tells us.
+#[derive(Default, Clone, Copy)]
+struct Repeat {
+	gap_seconds: u64,
+	/// The response was the same size as last time - the poll almost certainly
+	/// learned nothing.
+	unchanged: bool,
 }
 
 #[derive(Default)]
@@ -332,20 +380,32 @@ pub fn record(obs: Observation) {
 	let Ok(mut state) = STATE.write() else { return };
 
 	let hour = now_secs() / 3600;
-	state.by_endpoint.entry(obs.endpoint.clone()).or_default().record(&obs, hour);
-	state.by_route.entry(route).or_default().record(&obs, hour);
-
+	let now = now_secs();
 	let billed = obs.wire_bytes.unwrap_or(obs.json_bytes);
 
-	// Admit new paths only while there is room; existing ones keep counting.
+	// Resolve the repeat first: the endpoint buckets need to know whether this
+	// path has been seen before, and how long ago, which only the path table
+	// knows. Admit new paths only while there is room; existing ones keep
+	// counting either way.
 	let known = state.paths.contains_key(&obs.path);
-	if known || state.paths.len() < MAX_TRACKED_PATHS {
+	let repeat = if known || state.paths.len() < MAX_TRACKED_PATHS {
 		let stat = state.paths.entry(obs.path.clone()).or_default();
+		let repeat = (stat.requests > 0).then(|| Repeat {
+			gap_seconds: now.saturating_sub(stat.last_seen),
+			unchanged: stat.last_size == obs.json_bytes,
+		});
 		stat.requests += 1;
 		stat.wire_bytes += billed;
+		stat.last_seen = now;
+		stat.last_size = obs.json_bytes;
+		repeat
 	} else {
 		state.paths_evicted += 1;
-	}
+		None
+	};
+
+	state.by_endpoint.entry(obs.endpoint.clone()).or_default().record(&obs, hour, repeat);
+	state.by_route.entry(route).or_default().record(&obs, hour, repeat);
 
 	let stamp = now_secs() / 60;
 	let slot = (stamp as usize) % WINDOW_MINUTES;
@@ -398,6 +458,12 @@ fn bucket_json(name: &str, bucket: &Bucket, total_bytes: u64, hour: u64) -> serd
 		"share_of_body_bytes": if total_bytes == 0 { 0.0 } else { bucket.wire_bytes as f64 / total_bytes as f64 },
 		"mean_body_bytes": if bucket.requests == 0 { 0 } else { bucket.wire_bytes / bucket.requests },
 		"responses_without_content_length": bucket.wire_missing,
+		"repeats": bucket.repeats,
+		"repeats_returned_unchanged": bucket.repeats_unchanged,
+		"repeat_body_bytes": bucket.repeat_bytes,
+		"repeats_by_gap": GAP_BUCKETS.iter().enumerate()
+			.map(|(i, (_, label))| ((*label).to_string(), json!(bucket.repeat_gaps[i])))
+			.collect::<serde_json::Map<String, serde_json::Value>>(),
 		"errors": bucket.errors,
 		"cache_hits": bucket.cache_hits,
 		"cache_misses": bucket.cache_misses,
@@ -454,13 +520,22 @@ fn snapshot() -> serde_json::Value {
 	let mut by_repeat: Vec<_> = state.paths.iter().filter(|(_, s)| s.requests > 1).collect();
 	by_repeat.sort_by_key(|(_, s)| std::cmp::Reverse(s.requests));
 
-	let repeated_requests: u64 = state.paths.values().filter(|s| s.requests > 1).map(|s| s.requests - 1).sum();
-	let repeated_bytes: u64 = state
-		.paths
-		.values()
-		.filter(|s| s.requests > 1)
-		.map(|s| s.wire_bytes - (s.wire_bytes / s.requests))
-		.sum();
+	let repeats: u64 = state.by_endpoint.values().map(|b| b.repeats).sum();
+	let repeats_unchanged: u64 = state.by_endpoint.values().map(|b| b.repeats_unchanged).sum();
+	let repeats_unchanged_bytes: u64 = state.by_endpoint.values().map(|b| b.repeats_unchanged_bytes).sum();
+
+	// Repeats that a cache of a given TTL would have served, summed across
+	// endpoints. Cumulative, so each row answers "set the TTL here and this
+	// many upstream calls disappear".
+	let mut cumulative = 0u64;
+	let mut by_ttl = serde_json::Map::new();
+	for (index, (_, label)) in GAP_BUCKETS.iter().enumerate() {
+		cumulative += state.by_endpoint.values().map(|b| b.repeat_gaps[index]).sum::<u64>();
+		if *label == "over_6h" {
+			continue;
+		}
+		by_ttl.insert((*label).to_string(), json!(cumulative));
+	}
 
 	let calls = JSON_CALLS.load(Ordering::Relaxed);
 	let misses = CACHE_MISSES.load(Ordering::Relaxed);
@@ -502,14 +577,28 @@ fn snapshot() -> serde_json::Value {
 			"misses": misses,
 			"hit_rate": if calls == 0 { 0.0 } else { calls.saturating_sub(misses) as f64 / calls as f64 },
 		},
-		// Bytes spent on paths fetched more than once in the window. This is
-		// the ceiling on what a bigger cache or cross-feed dedup could save.
-		"duplication": {
+		// Re-fetches of an already-seen path. Deliberately NOT called waste:
+		// re-running a monitoring search on an interval is the mechanism, not
+		// duplication, and no count of repeats can tell the two apart. The two
+		// breakdowns below are what can be acted on.
+		"repeat_fetches": {
 			"distinct_paths": state.paths.len(),
-			"redundant_requests": repeated_requests,
-			"redundant_body_bytes": repeated_bytes,
-			"redundant_share_of_bytes": if total_bytes == 0 { 0.0 } else { repeated_bytes as f64 / total_bytes as f64 },
+			"repeats": repeats,
 			"paths_untracked_over_cap": state.paths_evicted,
+
+			// Repeats a cache of each TTL would have served, cumulative. This
+			// sizes the cache fix directly: pick the TTL, read the calls saved.
+			"caught_by_cache_ttl": by_ttl,
+
+			// Repeats whose response was the same size as the previous fetch,
+			// so the poll learned nothing. Unlike the raw repeat count this
+			// does separate necessary polling from wasted polling - a search
+			// that returns new posts earns its keep and is excluded here. A
+			// high share means the poll interval outruns the change rate.
+			"returned_unchanged": repeats_unchanged,
+			"returned_unchanged_share": if repeats == 0 { 0.0 } else { repeats_unchanged as f64 / repeats as f64 },
+			"returned_unchanged_body_bytes": repeats_unchanged_bytes,
+			"unchanged_detection": "response size equality (heuristic)",
 		},
 		"by_upstream_endpoint": endpoints.iter().map(|(name, b)| bucket_json(name, b, total_bytes, hour)).collect::<Vec<_>>(),
 		"by_inbound_route": routes.iter().map(|(name, b)| bucket_json(name, b, total_bytes, hour)).collect::<Vec<_>>(),
@@ -602,10 +691,11 @@ mod tests {
 		assert_eq!(small["name"], "/r/:sub/about");
 		assert_eq!(small["body_bytes_percentiles"]["p99"], 2_000);
 
-		// Two of the three thread fetches were redundant.
-		assert_eq!(snap["duplication"]["distinct_paths"], 51);
-		assert_eq!(snap["duplication"]["redundant_requests"], 2);
-		assert_eq!(snap["duplication"]["redundant_body_bytes"], 8_000_000);
+		// Two of the three thread fetches were repeats, and being identical in
+		// size, both learned nothing.
+		assert_eq!(snap["repeat_fetches"]["distinct_paths"], 51);
+		assert_eq!(snap["repeat_fetches"]["repeats"], 2);
+		assert_eq!(snap["repeat_fetches"]["returned_unchanged"], 2);
 
 		// Traffic lands in the rolling window, not just the totals.
 		let minutes = snap["per_minute"].as_array().expect("per_minute is an array");
@@ -648,11 +738,11 @@ mod tests {
 		};
 		let new = Observation { wire_bytes: Some(1_000), path: "/comments/new".into(), ..old.clone() };
 
-		bucket.record(&old, hour);
+		bucket.record(&old, hour, None);
 		assert_eq!(bucket.window_samples(hour).0, vec![9_000_000]);
 
 		// One hour later both are in the window.
-		bucket.record(&new, hour + 1);
+		bucket.record(&new, hour + 1, None);
 		let (mut wire, _) = bucket.window_samples(hour + 1);
 		wire.sort_unstable();
 		assert_eq!(wire, vec![1_000, 9_000_000]);
@@ -682,12 +772,50 @@ mod tests {
 		};
 
 		let hour = 1_000_000u64;
-		bucket.record(&obs, hour);
+		bucket.record(&obs, hour, None);
 		// Same slot index, exactly one window later.
-		bucket.record(&obs, hour + WINDOW_HOURS as u64);
+		bucket.record(&obs, hour + WINDOW_HOURS as u64, None);
 
 		let (wire, _) = bucket.window_samples(hour + WINDOW_HOURS as u64);
 		assert_eq!(wire, vec![500], "the lapped slot kept a stale sample");
+	}
+
+	/// The objection this metric has to survive: a monitoring search re-run on
+	/// an interval is the mechanism, not waste. A repeat that returns new
+	/// results must not be counted as having learned nothing, and the gap
+	/// histogram must place it where a cache TTL decision can be read off it.
+	#[sealed_test(env = [("REDLIB_TELEMETRY", "on")])]
+	fn a_poll_that_finds_new_results_is_not_counted_as_unchanged() {
+		let search = |bytes: u64| Observation {
+			endpoint: normalize_upstream("/r/rust/search.json"),
+			path: "/r/rust/search".into(),
+			status: 200,
+			wire_bytes: None,
+			json_bytes: bytes,
+			duration_ms: 100,
+			is_error: false,
+		};
+
+		// First poll, then one that found new posts (bigger), then one that
+		// found nothing new (same size again).
+		record(search(10_000));
+		record(search(12_000));
+		record(search(12_000));
+
+		let snap = snapshot();
+		assert_eq!(snap["repeat_fetches"]["repeats"], 2, "two re-polls");
+		assert_eq!(snap["repeat_fetches"]["returned_unchanged"], 1, "only the one that found nothing new");
+
+		// Both repeats happened immediately, so even a 30s cache would have
+		// served them - which is what makes this row actionable.
+		let ttl = &snap["repeat_fetches"]["caught_by_cache_ttl"];
+		assert_eq!(ttl["within_30s"], 2);
+		// Cumulative: a longer TTL catches at least as many, never fewer.
+		assert_eq!(ttl["within_1h"], 2);
+		assert!(ttl.get("over_6h").is_none(), "over_6h is not a TTL anyone would set");
+
+		let bucket = &snap["by_upstream_endpoint"][0];
+		assert_eq!(bucket["repeats_by_gap"]["within_30s"], 2);
 	}
 
 	#[test]
